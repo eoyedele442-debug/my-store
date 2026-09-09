@@ -1,26 +1,32 @@
-# --- server.py ---
 import os
-import stripe
-import hashlib
 import secrets
+import stripe
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 
 stripe.api_key = os.environ["STRIPE_SECRET_KEY"]
-WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
+WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+DOMAIN = os.environ.get("DOMAIN", "https://eoyedele442-debug.github.io/my-store")
 
 app = Flask(__name__)
+CORS(app)
 
 PLANS = {
-    "1m": {"price_cents": 700,  "name": "Pro — 1 Month",   "days": 30},
-    "3m": {"price_cents": 1800, "name": "Pro — 3 Months",  "days": 90},
-    "1y": {"price_cents": 6000, "name": "Pro — 1 Year",    "days": 365},
-    "lt": {"price_cents": 9900, "name": "Pro — Lifetime",  "days": None},
+    "1m": {"price_cents": 700,  "name": "Pro — 1 Month"},
+    "3m": {"price_cents": 1800, "name": "Pro — 3 Months"},
+    "1y": {"price_cents": 6000, "name": "Pro — 1 Year"},
+    "lt": {"price_cents": 9900, "name": "Pro — Lifetime"},
 }
+
+# in-memory store: session_id → license_key
+# replace with a real DB when you're ready
+license_store = {}
 
 def generate_license_key() -> str:
     raw = secrets.token_bytes(20)
     hex_key = raw.hex().upper()
     return "-".join(hex_key[i:i+5] for i in range(0, 20, 5))
+
 
 @app.route("/create-checkout-session", methods=["POST"])
 def create_checkout_session():
@@ -43,19 +49,38 @@ def create_checkout_session():
             "quantity": 1,
         }],
         mode="payment",
-        success_url=os.environ["DOMAIN"] + "/success?session_id={CHECKOUT_SESSION_ID}",
-        cancel_url=os.environ["DOMAIN"] + "/cancel",
-        payment_intent_data={
-            # gift card tolerance — skip zip/AVS hard failure
-            # Stripe still runs the check but won't decline on mismatch
-            "capture_method": "automatic",
-        },
-        billing_address_collection="auto",  # "auto" = optional, not required
-        # don't force address — kills prepaid cards that have none
+        success_url=DOMAIN + "/index.html?session_id={CHECKOUT_SESSION_ID}",
+        cancel_url=DOMAIN + "/index.html?cancelled=1",
+        billing_address_collection="auto",
         metadata={"plan_id": plan_id},
     )
 
     return jsonify({"checkout_url": session.url})
+
+
+@app.route("/session-key", methods=["GET"])
+def session_key():
+    session_id = request.args.get("session_id")
+    if not session_id:
+        return jsonify({"error": "Missing session_id"}), 400
+
+    # check in-memory store first
+    if session_id in license_store:
+        return jsonify({"license_key": license_store[session_id]})
+
+    # verify with Stripe that payment actually completed
+    try:
+        session = stripe.checkout.Session.retrieve(session_id)
+    except stripe.error.InvalidRequestError:
+        return jsonify({"error": "Invalid session"}), 400
+
+    if session.payment_status != "paid":
+        return jsonify({"error": "Payment not completed"}), 402
+
+    # generate and cache the key
+    key = generate_license_key()
+    license_store[session_id] = key
+    return jsonify({"license_key": key})
 
 
 @app.route("/webhook", methods=["POST"])
@@ -72,27 +97,18 @@ def stripe_webhook():
 
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
-        plan_id = session["metadata"]["plan_id"]
-        customer_email = session.get("customer_details", {}).get("email", "")
-        payment_intent_id = session.get("payment_intent", "")
-
-        license_key = generate_license_key()
-
-        # store in your DB here — minimum viable schema below
-        # INSERT INTO licenses (email, plan_id, license_key, payment_intent_id, created_at)
-        # VALUES (?, ?, ?, ?, NOW())
-
-        # send key via email — plug in SendGrid/Resend/Postmark here
-        deliver_license(customer_email, license_key, plan_id)
+        session_id = session["id"]
+        if session_id not in license_store:
+            license_store[session_id] = generate_license_key()
 
     return jsonify({"status": "ok"})
 
 
-def deliver_license(email: str, key: str, plan_id: str):
-    # swap for real email provider
-    # example: resend.emails.send({"to": email, "subject": "Your license key", ...})
-    print(f"[DELIVER] {email} → {key} (plan: {plan_id})")
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "running"})
 
 
 if __name__ == "__main__":
-    app.run(port=4242, debug=False)
+    port = int(os.environ.get("PORT", 4242))
+    app.run(host="0.0.0.0", port=port)
