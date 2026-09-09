@@ -15,7 +15,7 @@ PLANS = {
     "1m": {"price_cents": 700,  "name": "Pro — 1 Month"},
     "3m": {"price_cents": 1800, "name": "Pro — 3 Months"},
     "1y": {"price_cents": 6000, "name": "Pro — 1 Year"},
-    "lt": {"price_cents": 11300, "name": "Pro — Lifetime"},
+    "lt": {"price_cents": 10600, "name": "Pro — Lifetime"},
 }
 
 # in-memory store: session_id → license_key
